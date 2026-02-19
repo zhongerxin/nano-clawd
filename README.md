@@ -107,6 +107,29 @@ node dist/index_code.js
 node dist/index_code.js --help
 ```
 
+#### 使用 Bun 直接运行（免 build）
+
+开发阶段如果不想每次改完都 `npm run build`，可以直接运行 TypeScript 源码：
+
+```bash
+# 自定义入口（src/index.ts）
+bun run src/index.ts
+
+# pi-coding-agent runtime 入口（src/index_code.ts）
+bun run src/index_code.ts
+```
+
+查看 `index_code.ts` 的参数帮助：
+
+```bash
+bun run src/index_code.ts --help
+```
+
+说明：
+
+- 以上是开发态运行方式，改完源码可直接生效。
+- 需要发布/分发，或按 README 中 `node dist/...` 方式运行时，仍需要先执行 `npm run build`。
+
 #### 开发模式（使用 Bun）
 
 ```bash
