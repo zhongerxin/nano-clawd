@@ -1,8 +1,10 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent"
 import { Type } from "@sinclair/typebox"
 
-export default function reloadToolExtension(pi: ExtensionAPI) {
-  // Optional custom slash command (manual trigger)
+export default function (pi: ExtensionAPI) {
+  // 防止同一轮里被模型重复调用导致 followUp 连续入队
+  let reloadQueued = false
+
   pi.registerCommand("reload-runtime", {
     description: "Reload extensions, skills, prompts, and themes",
     handler: async (_args, ctx) => {
@@ -11,27 +13,29 @@ export default function reloadToolExtension(pi: ExtensionAPI) {
     },
   })
 
-  // LLM-callable tool
   pi.registerTool({
-    name: "reload",
-    label: "Reload Session",
-    description: "Reload the current session runtime (extensions/skills/prompts/themes)",
+    name: "reload_runtime",
+    label: "Reload Runtime",
+    description: "Queue /reload-runtime once as follow-up",
     parameters: Type.Object({}),
-    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-      // In print/json mode, queued user messages may not behave as expected.
-      if (!ctx.hasUI) {
+    async execute() {
+      if (reloadQueued) {
         return {
-          content: [{ type: "text", text: "当前为非交互模式，请手动执行 /reload。" }],
-          details: { queued: false, reason: "no_ui" },
+          content: [
+            { type: "text", text: "Reload already queued in this turn, skipping duplicate." },
+          ],
+          details: { skipped: true, queued: false },
         }
       }
 
-      // Use built-in /reload directly, and steer so it runs immediately after this tool.
-      pi.sendUserMessage("/reload", { deliverAs: "steer" })
+      reloadQueued = true
+      pi.sendUserMessage("/reload-runtime", { deliverAs: "followUp" })
 
       return {
-        content: [{ type: "text", text: "已在当前会话排队执行 /reload。" }],
-        details: { queued: true, command: "/reload", deliverAs: "steer" },
+        content: [
+          { type: "text", text: "Queued /reload-runtime as a follow-up command." },
+        ],
+        details: { skipped: false, queued: true },
       }
     },
   })

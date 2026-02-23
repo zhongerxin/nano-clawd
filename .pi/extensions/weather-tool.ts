@@ -47,7 +47,7 @@ function buildSummary(city: string, data: WttrResponse): { text: string; area: s
 
 export default function weatherToolExtension(pi: ExtensionAPI) {
   pi.registerTool({
-    name: "get_weathss98ewessr",
+    name: "get_wea349999999ssasa98ewessr",
     label: "Get Weather",
     description: "Get current weather for a city (e.g. Chengdu, Beijing, Shanghai)",
     parameters: Type.Object({
