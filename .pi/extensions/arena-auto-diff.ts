@@ -44,7 +44,7 @@ export default function arenaAutoDiffExtension(pi: ExtensionAPI) {
     const header = [
       "Arena 目录发生了变更。",
       "请你基于下面 diff，和当前上下文的要求，判断下一步应该做什么；如果需要行动请直接执行。",
-      "如果这次变更不需要你继续动作，请简短说明并等待下一次变更。",
+      "如果这次变更不需要你继续动作或者刚好是你上一次操作产生的变更，请回复：<|no_change|>。",
       "",
       "```diff",
       report,
