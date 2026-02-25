@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import * as fs from "node:fs"
 import { cp, mkdtemp, rm } from "node:fs/promises"
 import * as os from "node:os"
@@ -9,6 +9,23 @@ import { DEFAULT_MAX_LINES, truncateHead } from "@mariozechner/pi-coding-agent"
 const WATCH_DIR = "Arena"
 const DEBOUNCE_MS = 1200
 const MAX_DIFF_BYTES = 40 * 1024
+const RECENT_EVENT_TTL_MS = 5 * 60 * 1000
+const MAX_RECENT_EVENTS = 128
+const AUTO_WRITE_SUPPRESS_WINDOW_MS = 20 * 1000
+
+interface DiffEventMeta {
+  eventId: string
+  eventHash: string
+  fileKey: string
+}
+
+interface AutoActionRecord {
+  triggerEventId: string
+  triggerEventHash: string
+  triggerFileKey: string
+  triggeredAt: number
+  suppressNextMatchingDiff: boolean
+}
 
 async function copySnapshot(fromDir: string, toDir: string) {
   await cp(fromDir, toDir, {
@@ -23,6 +40,31 @@ async function copySnapshot(fromDir: string, toDir: string) {
   })
 }
 
+function hashDiff(text: string): string {
+  return createHash("sha256").update(text).digest("hex")
+}
+
+function extractChangedFiles(diff: string): string[] {
+  const files = new Set<string>()
+  const lines = diff.split("\n")
+
+  for (const line of lines) {
+    if (!line.startsWith("diff -ruN ")) continue
+    const parts = line.trim().split(/\s+/)
+    if (parts.length < 4) continue
+    const right = parts[3]
+    const normalized = right.startsWith(`${WATCH_DIR}/`) ? right.slice(WATCH_DIR.length + 1) : right
+    files.add(normalized)
+  }
+
+  return Array.from(files).sort()
+}
+
+function toFileKey(files: string[]): string {
+  if (files.length === 0) return "__unknown__"
+  return files.join("|")
+}
+
 export default function arenaAutoDiffExtension(pi: ExtensionAPI) {
   let watcher: fs.FSWatcher | undefined
   let arenaDir = ""
@@ -31,8 +73,35 @@ export default function arenaAutoDiffExtension(pi: ExtensionAPI) {
   let debounceTimer: NodeJS.Timeout | undefined
   let processing = false
   let rerunRequested = false
+  let recentEventHashes = new Map<string, number>()
+  let lastAutoAction: AutoActionRecord | undefined
 
-  const queueReport = (ctx: ExtensionContext, report: string) => {
+  const pruneRecentEvents = (now: number) => {
+    for (const [eventHash, seenAt] of recentEventHashes.entries()) {
+      if (now - seenAt > RECENT_EVENT_TTL_MS) {
+        recentEventHashes.delete(eventHash)
+      }
+    }
+
+    if (recentEventHashes.size <= MAX_RECENT_EVENTS) return
+    const ordered = Array.from(recentEventHashes.entries()).sort((a, b) => a[1] - b[1])
+    const overflow = ordered.length - MAX_RECENT_EVENTS
+    for (let i = 0; i < overflow; i++) {
+      recentEventHashes.delete(ordered[i][0])
+    }
+  }
+
+  const hasSeenEvent = (eventHash: string, now: number) => {
+    pruneRecentEvents(now)
+    return recentEventHashes.has(eventHash)
+  }
+
+  const rememberEvent = (eventHash: string, now: number) => {
+    recentEventHashes.set(eventHash, now)
+    pruneRecentEvents(now)
+  }
+
+  const queueReport = (ctx: ExtensionContext, report: string, meta: DiffEventMeta) => {
     // const header = [
     //   "Arena 目录发生变更。",
     //   "请你基于下面 diff，直接给我一份中文变化报告（重点改动、潜在风险、建议下一步）。",
@@ -45,6 +114,7 @@ export default function arenaAutoDiffExtension(pi: ExtensionAPI) {
       "Arena 目录发生了变更。",
       "请你基于下面 diff，和当前上下文的要求，判断下一步应该做什么；如果需要行动请直接执行。",
       "如果这次变更不需要你继续动作，请简短说明并等待下一次变更。",
+      `事件: ${meta.eventId} (${meta.eventHash.slice(0, 12)})`,
       "",
       "```diff",
       report,
@@ -53,10 +123,17 @@ export default function arenaAutoDiffExtension(pi: ExtensionAPI) {
 
     if (ctx.isIdle()) {
       pi.sendUserMessage(header)
-      return
+    } else {
+      pi.sendUserMessage(header, { deliverAs: "followUp" })
     }
 
-    pi.sendUserMessage(header, { deliverAs: "followUp" })
+    lastAutoAction = {
+      triggerEventId: meta.eventId,
+      triggerEventHash: meta.eventHash,
+      triggerFileKey: meta.fileKey,
+      triggeredAt: Date.now(),
+      suppressNextMatchingDiff: true,
+    }
   }
 
   const runDiffCheck = async (ctx: ExtensionContext) => {
@@ -91,6 +168,41 @@ export default function arenaAutoDiffExtension(pi: ExtensionAPI) {
         .replaceAll(nextSnapshot, WATCH_DIR)
         .trim()
 
+      const now = Date.now()
+      const eventHash = hashDiff(normalized)
+      const changedFiles = extractChangedFiles(normalized)
+      const fileKey = toFileKey(changedFiles)
+      const eventId = `arena-${now.toString(36)}-${eventHash.slice(0, 8)}`
+
+      if (hasSeenEvent(eventHash, now)) {
+        await rm(previousSnapshot, { recursive: true, force: true })
+        previousSnapshot = nextSnapshot
+        return
+      }
+
+      if (lastAutoAction) {
+        const ageMs = now - lastAutoAction.triggeredAt
+        if (ageMs > AUTO_WRITE_SUPPRESS_WINDOW_MS) {
+          lastAutoAction = undefined
+        } else {
+          const isDifferentFromTrigger = eventHash !== lastAutoAction.triggerEventHash
+          const isMatchingScope = fileKey === lastAutoAction.triggerFileKey
+          if (lastAutoAction.suppressNextMatchingDiff && isDifferentFromTrigger && isMatchingScope) {
+            lastAutoAction.suppressNextMatchingDiff = false
+            rememberEvent(eventHash, now)
+            if (ctx.hasUI) {
+              ctx.ui.notify(
+                `已忽略自动动作回流 diff (${lastAutoAction.triggerEventId} -> ${eventId})`,
+                "info",
+              )
+            }
+            await rm(previousSnapshot, { recursive: true, force: true })
+            previousSnapshot = nextSnapshot
+            return
+          }
+        }
+      }
+
       const truncation = truncateHead(normalized, {
         maxBytes: MAX_DIFF_BYTES,
         maxLines: DEFAULT_MAX_LINES,
@@ -102,7 +214,8 @@ export default function arenaAutoDiffExtension(pi: ExtensionAPI) {
       }
 
       if (report) {
-        queueReport(ctx, report)
+        queueReport(ctx, report, { eventId, eventHash, fileKey })
+        rememberEvent(eventHash, now)
       }
 
       await rm(previousSnapshot, { recursive: true, force: true })
